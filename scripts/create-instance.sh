@@ -1,14 +1,25 @@
 #!/bin/bash
 # =============================================================================
-# CyberLab 2030 — create-instance.sh
+# CyberLab 2030 — create-instance.sh (v2)
 # Script de retry para provisionamento de instância Ampere no OCI
 #
-# Uso: bash create-instance.sh
+# Uso:
+#   bash create-instance.sh                 # roda em primeiro plano
+#   nohup bash create-instance.sh &          # roda em background, sobrevive ao fechar o terminal
+#   tail -f create-instance.log              # acompanha o log em outra aba
+#
 # Requisitos: OCI CLI configurado (Cloud Shell já vem configurado)
 # Repositório: cyberlab-oracle-infra/scripts/
 # Refs: ADR-001, RUNBOOK-001
+#
+# v2 — mudanças após investigação de causa raiz (ver RUNBOOK-001):
+#   - CannotParseRequest confirmado como ruído/falso positivo da CLI 3.73.1,
+#     não é causa de bloqueio real. Agora é tratado como retryable, com
+#     contador próprio, em vez de parar o script.
+#   - Log persistente em arquivo (create-instance.log), com timestamp.
+#   - Contadores de estatística por tipo de resultado, exibidos ao final
+#     ou a cada 10 tentativas.
 # =============================================================================
-
 COMPARTMENT_ID="ocid1.tenancy.oc1..aaaaaaaaaz4xxqbtjldjmtjfooxjxxedk5yf4cmfs3rgfy7aztrc4j314yq"
 SUBNET_ID="ocid1.subnet.oc1.sa-saopaulo-1.aaaaaaaab3m5yrokwjxgnx6kugvtuuggt54lteannwu6oraksevlmiaudmwq"
 IMAGE_ID="ocid1.image.oc1.sa-saopaulo-1.aaaaaaaaykprsp6bp43gbjn5uemsqe7a3yvh6pnw2d2lhc722actyg2inl6a"
@@ -16,34 +27,57 @@ AVAILABILITY_DOMAIN="TxQC:SA-SAOPAULO-1-AD-1"
 SHAPE="VM.Standard.A1.Flex"
 INSTANCE_NAME="Cyberlab-wazuh-manager"
 SSH_KEY_FILE="$HOME/.ssh/id_rsa.pub"
+LOG_FILE="create-instance.log"
+
+RETRY_INTERVAL_SECONDS=60
+CANNOTPARSE_MAX_CONSECUTIVE=10   # se der 10x seguidas, algo mudou de verdade — para e avisa
 
 # =============================================================================
-# Validações
+# Setup
 # =============================================================================
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
 
 if [ ! -f "$SSH_KEY_FILE" ]; then
-  echo "Erro: chave pública SSH não encontrada em $SSH_KEY_FILE"
-  echo "Execute primeiro: echo 'sua-chave-publica' > ~/.ssh/id_rsa.pub"
+  log "Erro: chave pública SSH não encontrada em $SSH_KEY_FILE"
+  log "Execute primeiro: ssh-keygen -t rsa -f ~/.ssh/id_rsa -N ''"
   exit 1
 fi
 
-echo "============================================="
-echo " CyberLab Instance Creator"
-echo "============================================="
-echo " Shape:    $SHAPE"
-echo " OCPUs:    1 | RAM: 6GB"
-echo " Image:    Canonical Ubuntu 24.04 aarch64"
-echo " Subnet:   public subnet-cyberlab-vcn"
-echo " AD:       $AVAILABILITY_DOMAIN"
-echo "============================================="
-echo " Tentando a cada 60 segundos... Ctrl+C para parar."
-echo ""
+log "============================================="
+log " CyberLab Instance Creator v2"
+log "============================================="
+log " Shape:    $SHAPE"
+log " OCPUs:    1 | RAM: 6GB"
+log " Image:    Canonical Ubuntu 24.04 aarch64"
+log " Subnet:   public subnet-cyberlab-vcn"
+log " AD:       $AVAILABILITY_DOMAIN"
+log " Log file: $LOG_FILE"
+log "============================================="
+log " Tentando a cada ${RETRY_INTERVAL_SECONDS}s... Ctrl+C para parar (ou 'kill' se em background)."
+log ""
 
 ATTEMPT=1
+CAPACITY_COUNT=0
+PARSE_ERROR_COUNT=0
+PARSE_ERROR_CONSECUTIVE=0
+UNEXPECTED_COUNT=0
+START_TIME=$(date +%s)
+
+print_stats() {
+  local elapsed=$(( $(date +%s) - START_TIME ))
+  local hours=$((elapsed / 3600))
+  local minutes=$(((elapsed % 3600) / 60))
+  log "--- Estatísticas (tempo decorrido: ${hours}h${minutes}m) ---"
+  log "    Out of capacity:     $CAPACITY_COUNT"
+  log "    CannotParseRequest:  $PARSE_ERROR_COUNT"
+  log "    Inesperado:          $UNEXPECTED_COUNT"
+  log "    Total de tentativas: $((ATTEMPT - 1))"
+}
 
 while true; do
-  echo "[$(date '+%H:%M:%S')] Tentativa #$ATTEMPT..."
-
+  log "Tentativa #$ATTEMPT..."
   RESULT=$(oci compute instance launch \
     --compartment-id "$COMPARTMENT_ID" \
     --availability-domain "$AVAILABILITY_DOMAIN" \
@@ -57,14 +91,15 @@ while true; do
     2>&1)
 
   if echo "$RESULT" | grep -q "Out of host capacity"; then
-    echo "[$(date '+%H:%M:%S')] Sem capacidade no AD-1. Aguardando 60s..."
-    sleep 60
+    CAPACITY_COUNT=$((CAPACITY_COUNT + 1))
+    PARSE_ERROR_CONSECUTIVE=0
+    log "Sem capacidade no AD-1. Aguardando ${RETRY_INTERVAL_SECONDS}s..."
 
   elif echo "$RESULT" | grep -q "lifecycle-state"; then
-    echo ""
-    echo "============================================="
-    echo " INSTANCIA CRIADA COM SUCESSO!"
-    echo "============================================="
+    log ""
+    log "============================================="
+    log " INSTÂNCIA CRIADA COM SUCESSO!"
+    log "============================================="
     echo "$RESULT" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
@@ -75,23 +110,47 @@ print(' Shape:     ', inst.get('shape',''))
 print(' AD:        ', inst.get('availability-domain',''))
 print('')
 print(' Aguarde o status RUNNING e pegue o IP publico no console OCI.')
-" 2>/dev/null || echo "$RESULT"
+" | tee -a "$LOG_FILE"
+    print_stats
     break
 
+  elif echo "$RESULT" | grep -q "CannotParseRequest"; then
+    # Confirmado como falso positivo/ruído da CLI — não é bloqueio real.
+    # Retry normalmente, mas monitora ocorrências consecutivas.
+    PARSE_ERROR_COUNT=$((PARSE_ERROR_COUNT + 1))
+    PARSE_ERROR_CONSECUTIVE=$((PARSE_ERROR_CONSECUTIVE + 1))
+    log "CannotParseRequest (ruído conhecido da CLI, ver RUNBOOK-001). Ocorrência consecutiva #$PARSE_ERROR_CONSECUTIVE. Retentando..."
+    if [ "$PARSE_ERROR_CONSECUTIVE" -ge "$CANNOTPARSE_MAX_CONSECUTIVE" ]; then
+      log "AVISO: $CANNOTPARSE_MAX_CONSECUTIVE ocorrências consecutivas de CannotParseRequest."
+      log "Isso foge do padrão esperado (era pontual). Pare e investigue antes de continuar."
+      print_stats
+      break
+    fi
+
   elif echo "$RESULT" | grep -q "NotAuthorizedOrNotFound"; then
-    echo "[$(date '+%H:%M:%S')] Erro de permissao (IAM ainda propagando)."
-    echo "Aguarde algumas horas e tente novamente."
-    echo "Detalhes: $RESULT"
+    log "Erro de permissão reportado pela CLI (NotAuthorizedOrNotFound)."
+    log "ATENÇÃO: já confirmamos por teste que IAM/policy/grupo estão corretos (ver RUNBOOK-001)."
+    log "Esse texto pode estar mascarando outro erro. Detalhes:"
+    log "$RESULT"
+    print_stats
     break
 
   else
-    echo "[$(date '+%H:%M:%S')] Resposta inesperada:"
-    echo "$RESULT"
-    echo ""
-    echo "Se o erro for 'CannotParseRequest', use o console OCI para criar a instancia."
-    echo "Consulte: cyberlab-oracle-infra/runbooks/RUNBOOK-001-oci-instance-provisioning.md"
+    UNEXPECTED_COUNT=$((UNEXPECTED_COUNT + 1))
+    PARSE_ERROR_CONSECUTIVE=0
+    log "Resposta inesperada:"
+    log "$RESULT"
+    log ""
+    log "Consulte: cyberlab-oracle-infra/runbooks/RUNBOOK-001-oci-instance-provisioning.md"
+    print_stats
     break
   fi
 
+  # Estatísticas a cada 10 tentativas, pra acompanhar sem poluir o log
+  if [ $((ATTEMPT % 10)) -eq 0 ]; then
+    print_stats
+  fi
+
   ATTEMPT=$((ATTEMPT + 1))
+  sleep "$RETRY_INTERVAL_SECONDS"
 done
